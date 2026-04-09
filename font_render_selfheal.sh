@@ -1,15 +1,27 @@
 #!/usr/bin/env bash
+# =============================================================================
+# font_render_selfheal.sh (CLEAN TRUE IDEMPOTENT v3.0)
+# =============================================================================
+# PURPOSE:
+#   Deterministic font system self-healing without false positives.
+#
+# CHANGES:
+#   ✔ REMOVED rendering probe (non-deterministic / unreliable)
+#   ✔ Retains only deterministic validation layers
+#   ✔ Guarantees no false repair triggers
+# =============================================================================
+
 set -euo pipefail
 
 LOG="/tmp/font_selfheal_$(date +%s).log"
 exec > >(tee -a "$LOG") 2>&1
 
-echo "=== FONT RENDER SELF-HEAL START ==="
+echo "=== FONT SELF-HEAL (CLEAN IDEMPOTENT) START ==="
 echo "Log: $LOG"
 echo ""
 
 # -----------------------------
-# 0. Root escalation
+# Root escalation
 # -----------------------------
 if [[ $EUID -ne 0 ]]; then
     SUDO="sudo"
@@ -18,12 +30,12 @@ else
 fi
 
 # -----------------------------
-# 1. Detect package manager
+# Package manager detection
 # -----------------------------
 echo "[1] Detecting package manager..."
 
 if command -v dnf >/dev/null 2>&1; then
-    PKG_INSTALL="dnf install -y"
+    PKG_INSTALL="dnf install -y --skip-unavailable"
 elif command -v apt >/dev/null 2>&1; then
     PKG_INSTALL="apt update -y && apt install -y"
 else
@@ -32,81 +44,110 @@ else
 fi
 
 # -----------------------------
-# 2. Install required packages
+# FORENSIC VALIDATION
 # -----------------------------
-echo "[2] Installing required packages..."
+echo "[2] Running forensic validation..."
 
-$SUDO bash -c "$PKG_INSTALL \
-    fontconfig \
-    freetype \
-    cairo \
-    pango \
-    fonts-noto-core || true"
+FAIL_FONTCONFIG=0
+FIX_DPI=0
+FIX_GTK=0
+FIX_FALLBACK=0
 
-# Fedora-specific (safe fallback)
-$SUDO bash -c "$PKG_INSTALL \
-    google-noto-sans-fonts \
-    google-noto-serif-fonts \
-    dejavu-sans-fonts \
-    abattis-cantarell-fonts \
-    abattis-cantarell-vf-fonts \
-    adwaita-fonts || true"
+echo " - Checking fontconfig resolution..."
+MATCH=$(fc-match "sans" || true)
 
-# -----------------------------
-# 3. Reset font caches
-# -----------------------------
-echo "[3] Resetting font caches..."
-
-$SUDO rm -rf /var/cache/fontconfig/* || true
-rm -rf ~/.cache/fontconfig || true
-
-fc-cache -rv
-
-# -----------------------------
-# 4. Validate fontconfig
-# -----------------------------
-echo "[4] Validating fontconfig..."
-
-if ! fc-match "sans" >/dev/null 2>&1; then
-    echo "ERROR: fontconfig resolution failed"
-    exit 1
-fi
-
-# deeper validation
-fc-list | grep -qi "noto\|dejavu\|cantarell" || {
-    echo "WARNING: expected fonts not detected"
-}
-
-# -----------------------------
-# 5. Reset GTK fonts (if available)
-# -----------------------------
-echo "[5] Resetting GTK font configuration..."
-
-if command -v gsettings >/dev/null 2>&1; then
-    gsettings set org.gnome.desktop.interface font-name 'Cantarell 11' || true
-    gsettings set org.gnome.desktop.interface document-font-name 'Cantarell 11' || true
-    gsettings set org.gnome.desktop.interface monospace-font-name 'DejaVu Sans Mono 11' || true
+if [[ -z "$MATCH" ]]; then
+    echo "   FAIL: fontconfig resolution failed"
+    FAIL_FONTCONFIG=1
 else
-    echo "Skipping gsettings (not available)"
+    echo "   OK: $MATCH"
+fi
+
+echo " - Checking font list integrity..."
+if ! fc-list | head -n 1 >/dev/null 2>&1; then
+    echo "   FAIL: fc-list failed"
+    FAIL_FONTCONFIG=1
+else
+    echo "   OK: font list accessible"
+fi
+
+echo " - Checking DPI..."
+CURRENT_DPI=$(xrdb -query 2>/dev/null | grep -i "Xft.dpi" || true)
+
+if [[ -n "$CURRENT_DPI" ]] && ! echo "$CURRENT_DPI" | grep -q "96"; then
+    echo "   WARN: DPI not normalized"
+    FIX_DPI=1
+else
+    echo "   OK: DPI"
+fi
+
+echo " - Checking GTK config..."
+if command -v gsettings >/dev/null 2>&1; then
+    CURRENT_FONT=$(gsettings get org.gnome.desktop.interface font-name || echo "")
+    if ! echo "$CURRENT_FONT" | grep -qi "Cantarell"; then
+        echo "   WARN: GTK font not standard"
+        FIX_GTK=1
+    else
+        echo "   OK: GTK font"
+    fi
+else
+    echo "   SKIP: gsettings not available"
+fi
+
+echo " - Checking fallback config..."
+if [[ ! -f ~/.config/fontconfig/fonts.conf ]]; then
+    echo "   WARN: missing fallback config"
+    FIX_FALLBACK=1
+else
+    echo "   OK: fallback config"
 fi
 
 # -----------------------------
-# 6. Normalize environment
+# DECISION ENGINE
 # -----------------------------
-echo "[6] Normalizing environment..."
+echo "[3] Decision engine..."
 
-export LANG=en_US.UTF-8
-unset LC_ALL || true
-unset GDK_SCALE || true
-unset GDK_DPI_SCALE || true
-unset XFT_DPI || true
+NEEDS_REPAIR=0
+
+if [[ "$FAIL_FONTCONFIG" -eq 1 ]]; then
+    NEEDS_REPAIR=1
+fi
+
+if [[ "$NEEDS_REPAIR" -eq 0 && \
+      "$FIX_DPI" -eq 0 && \
+      "$FIX_GTK" -eq 0 && \
+      "$FIX_FALLBACK" -eq 0 ]]; then
+
+    echo ""
+    echo "=== RESULT ==="
+    echo "✔ SYSTEM HEALTHY (NO-OP)"
+    echo ""
+    echo "Log file: $LOG"
+    exit 0
+fi
 
 # -----------------------------
-# 7. Reload X11 resources
+# REPAIR
 # -----------------------------
-echo "[7] Reloading X11 resources..."
+echo "[4] Applying repairs..."
 
-if command -v xrdb >/dev/null 2>&1; then
+if [[ "$NEEDS_REPAIR" -eq 1 ]]; then
+    echo "[4A] Reinstalling font stack..."
+
+    $SUDO bash -c "$PKG_INSTALL \
+        fontconfig freetype cairo pango \
+        google-noto-sans-fonts google-noto-serif-fonts \
+        dejavu-sans-fonts \
+        abattis-cantarell-fonts abattis-cantarell-vf-fonts || true"
+
+    echo "[4A] Rebuilding caches..."
+    $SUDO rm -rf /var/cache/fontconfig/* || true
+    rm -rf ~/.cache/fontconfig || true
+    fc-cache -rv
+fi
+
+if [[ "$FIX_DPI" -eq 1 ]]; then
+    echo "[4B] Fixing DPI..."
     xrdb -merge <<EOF
 Xft.dpi: 96
 Xft.antialias: 1
@@ -114,14 +155,19 @@ Xft.hinting: 1
 EOF
 fi
 
-# -----------------------------
-# 8. Font fallback override
-# -----------------------------
-echo "[8] Creating font fallback override..."
+if [[ "$FIX_GTK" -eq 1 ]]; then
+    echo "[4C] Fixing GTK..."
+    gsettings set org.gnome.desktop.interface font-name 'Cantarell 11' || true
+    gsettings set org.gnome.desktop.interface document-font-name 'Cantarell 11' || true
+    gsettings set org.gnome.desktop.interface monospace-font-name 'DejaVu Sans Mono 11' || true
+fi
 
-mkdir -p ~/.config/fontconfig
+if [[ "$FIX_FALLBACK" -eq 1 ]]; then
+    echo "[4D] Creating fallback config..."
 
-cat > ~/.config/fontconfig/fonts.conf <<'EOF'
+    mkdir -p ~/.config/fontconfig
+
+    cat > ~/.config/fontconfig/fonts.conf <<'EOF'
 <?xml version="1.0"?>
 <!DOCTYPE fontconfig SYSTEM "urn:fontconfig:fonts.dtd">
 <fontconfig>
@@ -136,26 +182,22 @@ cat > ~/.config/fontconfig/fonts.conf <<'EOF'
 </fontconfig>
 EOF
 
-fc-cache -rv
-
-# -----------------------------
-# 9. Rendering test
-# -----------------------------
-echo "[9] Running rendering test..."
-
-TEST_FILE="/tmp/font_test_$$.txt"
-echo "FONT TEST: The quick brown fox jumps over the lazy dog 1234567890 □" > "$TEST_FILE"
-
-if command -v gedit >/dev/null 2>&1; then
-    gedit "$TEST_FILE" >/dev/null 2>&1 &
+    fc-cache -r
 fi
 
 # -----------------------------
-# 10. Final result
+# SESSION STATE
 # -----------------------------
+echo "[5] Session state..."
+
+if [[ "$FIX_DPI" -eq 1 || "$FIX_GTK" -eq 1 || "$NEEDS_REPAIR" -eq 1 ]]; then
+    echo ""
+    echo "⚠ ACTION REQUIRED:"
+    echo "→ Log out and log back in"
+fi
+
 echo ""
 echo "=== RESULT ==="
-echo "⚠ IMPORTANT: Log out and log back in for full fix"
+echo "✔ Repairs applied (deterministic only)"
 echo ""
 echo "Log file: $LOG"
-echo "DONE"
